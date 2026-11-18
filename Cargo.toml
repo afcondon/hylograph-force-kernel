@@ -9,6 +9,9 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["console_error_panic_hook"]
+# Build the kernel at f64 instead of f32, for checking the port against
+# d3-force exactly. Not the shipped configuration.
+f64 = []
 
 [dependencies]
 wasm-bindgen = "0.2"

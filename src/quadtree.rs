@@ -1,443 +1,364 @@
-//! Quadtree implementation for Barnes-Hut force calculation
+//! Point quadtree for the many-body and collide forces.
 //!
-//! Direct port of D3's d3-quadtree for behavioral parity
+//! A port of the parts of d3-quadtree 3.0.1 that d3-force uses: `addAll`
+//! (with `cover`), `visit` and `visitAfter`. The shape of the tree decides
+//! which cells Barnes-Hut approximates and in which order points are met, so
+//! it is reproduced exactly rather than approximately:
+//!
+//! - the root square has an integer origin and a power-of-two side, found by
+//!   flooring the first corner of the extent and doubling until the second
+//!   corner is covered (`cover.js`);
+//! - a point goes right/down when `x >= xm` / `y >= ym`;
+//! - points with identical coordinates share one leaf as a chain, newest
+//!   first (`add.js`);
+//! - `visit` is pre-order, children in the order 0, 1, 2, 3.
+//!
+//! Storage is an arena (indices, not boxes) so a tree can be rebuilt every
+//! tick without allocating.
 
-/// A node in the quadtree - either internal (4 children) or leaf (point data)
-#[derive(Clone)]
-pub enum QuadNode {
-    /// Internal node with 4 children (NW=0, NE=1, SW=2, SE=3)
-    Internal {
-        children: [Option<Box<QuadNode>>; 4],
-        // Accumulated values for Barnes-Hut
-        x: f32,      // Center of mass x
-        y: f32,      // Center of mass y
-        value: f32,  // Total strength
-    },
-    /// Leaf node with point data
-    Leaf {
-        index: usize,  // Index into positions array
-        x: f32,        // Point x position
-        y: f32,        // Point y position
-        value: f32,    // Strength
-        next: Option<Box<QuadNode>>,  // Linked list for coincident points
-    },
+use crate::Real;
+
+/// "No node here". Note that this value also has `LEAF_BIT` set, so test for
+/// `NONE` before asking `is_leaf`.
+pub const NONE: u32 = u32::MAX;
+
+const LEAF_BIT: u32 = 1 << 31;
+
+/// Splitting stops here even if two points are still in the same cell. Two
+/// distinct float values are always separated long before this (the cell side
+/// halves each level), so the cap only guards against a hang.
+const MAX_SPLIT_DEPTH: u32 = 512;
+
+/// Is this reference a leaf (a point, heading a chain of coincident points)?
+#[inline]
+pub fn is_leaf(q: u32) -> bool {
+    q & LEAF_BIT != 0
 }
 
-impl QuadNode {
-    fn new_internal() -> QuadNode {
-        QuadNode::Internal {
-            children: [None, None, None, None],
-            x: 0.0,
-            y: 0.0,
-            value: 0.0,
-        }
-    }
-
-    fn new_leaf(index: usize, x: f32, y: f32, strength: f32) -> QuadNode {
-        QuadNode::Leaf {
-            index,
-            x,
-            y,
-            value: strength,
-            next: None,
-        }
-    }
-
-    /// Check if this is a leaf node
-    pub fn is_leaf(&self) -> bool {
-        matches!(self, QuadNode::Leaf { .. })
-    }
-
-    /// Get accumulated x (center of mass)
-    pub fn get_x(&self) -> f32 {
-        match self {
-            QuadNode::Internal { x, .. } => *x,
-            QuadNode::Leaf { x, .. } => *x,
-        }
-    }
-
-    /// Get accumulated y (center of mass)
-    pub fn get_y(&self) -> f32 {
-        match self {
-            QuadNode::Internal { y, .. } => *y,
-            QuadNode::Leaf { y, .. } => *y,
-        }
-    }
-
-    /// Get accumulated strength value
-    pub fn get_value(&self) -> f32 {
-        match self {
-            QuadNode::Internal { value, .. } => *value,
-            QuadNode::Leaf { value, .. } => *value,
-        }
-    }
+/// The point index a leaf reference names (the head of its chain).
+#[inline]
+pub fn leaf_point(q: u32) -> usize {
+    (q & !LEAF_BIT) as usize
 }
 
-/// Quadtree for spatial partitioning
+#[inline]
+fn leaf(point: usize) -> u32 {
+    point as u32 | LEAF_BIT
+}
+
+/// A node together with the square it covers, as handed to `visit` callbacks.
+#[derive(Clone, Copy)]
+pub struct Quad {
+    pub node: u32,
+    pub x0: Real,
+    pub y0: Real,
+    pub x1: Real,
+    pub y1: Real,
+}
+
 pub struct Quadtree {
-    pub root: Option<Box<QuadNode>>,
-    pub x0: f32,  // Bounding box
-    pub y0: f32,
-    pub x1: f32,
-    pub y1: f32,
+    /// Root square. NaN while the tree is empty.
+    pub x0: Real,
+    pub y0: Real,
+    pub x1: Real,
+    pub y1: Real,
+    /// `NONE`, a leaf reference, or the index of an internal node.
+    pub root: u32,
+    /// Internal nodes: four child references each.
+    pub children: Vec<[u32; 4]>,
+    /// Per point: the next point at identical coordinates, or `NONE`.
+    pub next: Vec<u32>,
+    /// Per point: the coordinates it was inserted at.
+    pub xs: Vec<Real>,
+    pub ys: Vec<Real>,
+    /// Per internal node: payload written by the force that owns the tree
+    /// (many-body: centre of charge and total charge; collide: `iv` is the
+    /// largest radius below).
+    pub ix: Vec<Real>,
+    pub iy: Vec<Real>,
+    pub iv: Vec<Real>,
+    /// Per point: payload for the leaf this point heads.
+    pub lv: Vec<Real>,
+    /// Internal nodes with every parent before its children. Filled by
+    /// `order`; walk it backwards for a post-order (`visitAfter`) pass.
+    pub pre_order: Vec<u32>,
 }
 
 impl Quadtree {
-    /// Create empty quadtree
     pub fn new() -> Quadtree {
         Quadtree {
-            root: None,
-            x0: f32::NAN,
-            y0: f32::NAN,
-            x1: f32::NAN,
-            y1: f32::NAN,
+            x0: Real::NAN,
+            y0: Real::NAN,
+            x1: Real::NAN,
+            y1: Real::NAN,
+            root: NONE,
+            children: Vec::new(),
+            next: Vec::new(),
+            xs: Vec::new(),
+            ys: Vec::new(),
+            ix: Vec::new(),
+            iy: Vec::new(),
+            iv: Vec::new(),
+            lv: Vec::new(),
+            pre_order: Vec::new(),
         }
     }
 
-    /// Build quadtree from positions and strengths
-    pub fn from_nodes(positions: &[f32], strengths: &[f32], n_nodes: usize) -> Quadtree {
-        let mut tree = Quadtree::new();
-
-        // First pass: compute bounding box
-        let mut x0 = f32::INFINITY;
-        let mut y0 = f32::INFINITY;
-        let mut x1 = f32::NEG_INFINITY;
-        let mut y1 = f32::NEG_INFINITY;
-
-        for i in 0..n_nodes {
-            let x = positions[i * 2];
-            let y = positions[i * 2 + 1];
-            if x.is_finite() && y.is_finite() {
-                x0 = x0.min(x);
-                y0 = y0.min(y);
-                x1 = x1.max(x);
-                y1 = y1.max(y);
-            }
-        }
-
-        // Expand to square (D3 does this)
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        if dx > dy {
-            y1 = y0 + dx;
-        } else {
-            x1 = x0 + dy;
-        }
-
-        // Add small padding to avoid edge cases
-        let padding = (x1 - x0).max(1.0) * 0.001;
-        tree.x0 = x0 - padding;
-        tree.y0 = y0 - padding;
-        tree.x1 = x1 + padding;
-        tree.y1 = y1 + padding;
-
-        // Second pass: insert all points
-        for i in 0..n_nodes {
-            let x = positions[i * 2];
-            let y = positions[i * 2 + 1];
-            if x.is_finite() && y.is_finite() {
-                let strength = if i < strengths.len() { strengths[i] } else { 1.0 };
-                tree.add(i, x, y, strength);
-            }
-        }
-
-        tree
-    }
-
-    /// Add a point to the quadtree
-    pub fn add(&mut self, index: usize, x: f32, y: f32, strength: f32) {
-        if x.is_nan() || y.is_nan() {
-            return;
-        }
-
-        // Expand bounds if needed
-        if self.x0.is_nan() {
-            self.x0 = x;
-            self.y0 = y;
-            self.x1 = x + 1.0;
-            self.y1 = y + 1.0;
-        } else {
-            self.cover(x, y);
-        }
-
-        let new_leaf = QuadNode::new_leaf(index, x, y, strength);
-
-        if self.root.is_none() {
-            self.root = Some(Box::new(new_leaf));
-            return;
-        }
-
-        // Insert into tree
-        self.insert(new_leaf, x, y);
-    }
-
-    /// Expand bounds to cover point
-    fn cover(&mut self, x: f32, y: f32) {
-        if x < self.x0 || x > self.x1 || y < self.y0 || y > self.y1 {
-            // Expand bounds (simplified - D3 does doubling)
-            self.x0 = self.x0.min(x);
-            self.y0 = self.y0.min(y);
-            self.x1 = self.x1.max(x);
-            self.y1 = self.y1.max(y);
-
-            // Make square
-            let dx = self.x1 - self.x0;
-            let dy = self.y1 - self.y0;
-            if dx > dy {
-                self.y1 = self.y0 + dx;
-            } else {
-                self.x1 = self.x0 + dy;
-            }
-        }
-    }
-
-    /// Insert a leaf node into the tree
-    fn insert(&mut self, leaf: QuadNode, x: f32, y: f32) {
-        let (leaf_x, leaf_y, leaf_strength, leaf_index) = match &leaf {
-            QuadNode::Leaf { x, y, value, index, .. } => (*x, *y, *value, *index),
-            _ => return,
-        };
-
-        // Navigate to insertion point
-        let mut x0 = self.x0;
-        let mut y0 = self.y0;
-        let mut x1 = self.x1;
-        let mut y1 = self.y1;
-
-        let root = self.root.take();
-        self.root = Some(Self::insert_recursive(
-            root, leaf, leaf_x, leaf_y, leaf_index, x0, y0, x1, y1
-        ));
-    }
-
-    fn insert_recursive(
-        node: Option<Box<QuadNode>>,
-        leaf: QuadNode,
-        x: f32,
-        y: f32,
-        index: usize,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-    ) -> Box<QuadNode> {
-        match node {
-            None => Box::new(leaf),
-            Some(mut existing) => {
-                match existing.as_mut() {
-                    QuadNode::Internal { children, .. } => {
-                        // Find which quadrant
-                        let xm = (x0 + x1) / 2.0;
-                        let ym = (y0 + y1) / 2.0;
-                        let right = x >= xm;
-                        let bottom = y >= ym;
-                        let i = (bottom as usize) << 1 | (right as usize);
-
-                        let (nx0, ny0, nx1, ny1) = Self::quadrant_bounds(x0, y0, x1, y1, i);
-
-                        let child = children[i].take();
-                        children[i] = Some(Self::insert_recursive(
-                            child, leaf, x, y, index, nx0, ny0, nx1, ny1
-                        ));
-                        existing
-                    }
-                    QuadNode::Leaf { x: ex, y: ey, index: ei, value: ev, next } => {
-                        // Check for coincident points
-                        if (x - *ex).abs() < 0.0001 && (y - *ey).abs() < 0.0001 {
-                            // Add to linked list
-                            let mut new_leaf = leaf;
-                            if let QuadNode::Leaf { next: ref mut n, .. } = new_leaf {
-                                *n = Some(existing);
-                            }
-                            return Box::new(new_leaf);
-                        }
-
-                        // Split: create internal node
-                        let old_leaf = QuadNode::Leaf {
-                            index: *ei,
-                            x: *ex,
-                            y: *ey,
-                            value: *ev,
-                            next: next.take(),
-                        };
-
-                        let mut internal = QuadNode::new_internal();
-
-                        // Insert both leaves
-                        let xm = (x0 + x1) / 2.0;
-                        let ym = (y0 + y1) / 2.0;
-
-                        // Insert old leaf
-                        let right_old = *ex >= xm;
-                        let bottom_old = *ey >= ym;
-                        let i_old = (bottom_old as usize) << 1 | (right_old as usize);
-
-                        // Insert new leaf
-                        let right_new = x >= xm;
-                        let bottom_new = y >= ym;
-                        let i_new = (bottom_new as usize) << 1 | (right_new as usize);
-
-                        if let QuadNode::Internal { children, .. } = &mut internal {
-                            let (nx0, ny0, nx1, ny1) = Self::quadrant_bounds(x0, y0, x1, y1, i_old);
-                            children[i_old] = Some(Self::insert_recursive(
-                                None, old_leaf, *ex, *ey, *ei, nx0, ny0, nx1, ny1
-                            ));
-
-                            if i_new != i_old {
-                                let (nx0, ny0, nx1, ny1) = Self::quadrant_bounds(x0, y0, x1, y1, i_new);
-                                children[i_new] = Some(Self::insert_recursive(
-                                    None, leaf, x, y, index, nx0, ny0, nx1, ny1
-                                ));
-                            } else {
-                                // Same quadrant - recurse
-                                let (nx0, ny0, nx1, ny1) = Self::quadrant_bounds(x0, y0, x1, y1, i_new);
-                                children[i_new] = Some(Self::insert_recursive(
-                                    children[i_new].take(), leaf, x, y, index, nx0, ny0, nx1, ny1
-                                ));
-                            }
-                        }
-
-                        Box::new(internal)
-                    }
-                }
-            }
-        }
-    }
-
-    fn quadrant_bounds(x0: f32, y0: f32, x1: f32, y1: f32, quadrant: usize) -> (f32, f32, f32, f32) {
-        let xm = (x0 + x1) / 2.0;
-        let ym = (y0 + y1) / 2.0;
-        match quadrant {
-            0 => (x0, y0, xm, ym),   // NW
-            1 => (xm, y0, x1, ym),   // NE
-            2 => (x0, ym, xm, y1),   // SW
-            3 => (xm, ym, x1, y1),   // SE
-            _ => (x0, y0, x1, y1),
-        }
-    }
-
-    /// Post-order traversal (visitAfter) - used to accumulate values up the tree
-    pub fn visit_after<F>(&mut self, mut callback: F)
+    /// Rebuild the tree over `n` points (d3's `quadtree(nodes, x, y)`).
+    /// Points with a non-finite coordinate are left out, as d3 leaves out NaN.
+    pub fn build<C>(&mut self, n: usize, coord: C)
     where
-        F: FnMut(&mut QuadNode, f32, f32, f32, f32),
+        C: Fn(usize) -> (Real, Real),
     {
-        if let Some(ref mut root) = self.root {
-            Self::visit_after_recursive(root, &mut callback, self.x0, self.y0, self.x1, self.y1);
-        }
-    }
+        self.x0 = Real::NAN;
+        self.y0 = Real::NAN;
+        self.x1 = Real::NAN;
+        self.y1 = Real::NAN;
+        self.root = NONE;
+        self.children.clear();
+        self.pre_order.clear();
+        self.next.clear();
+        self.next.resize(n, NONE);
+        self.lv.clear();
+        self.lv.resize(n, 0.0);
+        self.xs.clear();
+        self.ys.clear();
 
-    fn visit_after_recursive<F>(
-        node: &mut Box<QuadNode>,
-        callback: &mut F,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-    ) where
-        F: FnMut(&mut QuadNode, f32, f32, f32, f32),
-    {
-        // First visit children (post-order)
-        if let QuadNode::Internal { children, .. } = node.as_mut() {
-            for i in 0..4 {
-                if let Some(ref mut child) = children[i] {
-                    let (cx0, cy0, cx1, cy1) = Self::quadrant_bounds(x0, y0, x1, y1, i);
-                    Self::visit_after_recursive(child, callback, cx0, cy0, cx1, cy1);
-                }
+        let mut ex0 = Real::INFINITY;
+        let mut ey0 = Real::INFINITY;
+        let mut ex1 = Real::NEG_INFINITY;
+        let mut ey1 = Real::NEG_INFINITY;
+        for i in 0..n {
+            let (x, y) = coord(i);
+            self.xs.push(x);
+            self.ys.push(y);
+            if !(x.is_finite() && y.is_finite()) {
+                continue;
+            }
+            if x < ex0 {
+                ex0 = x;
+            }
+            if x > ex1 {
+                ex1 = x;
+            }
+            if y < ey0 {
+                ey0 = y;
+            }
+            if y > ey1 {
+                ey1 = y;
             }
         }
-        // Then visit this node
-        callback(node.as_mut(), x0, y0, x1, y1);
-    }
+        if ex0 > ex1 || ey0 > ey1 {
+            return; // no valid points
+        }
 
-    /// Pre-order traversal (visit) - used for Barnes-Hut force calculation
-    /// Callback returns true to skip children
-    pub fn visit<F>(&self, mut callback: F)
-    where
-        F: FnMut(&QuadNode, f32, f32, f32, f32) -> bool,
-    {
-        if let Some(ref root) = self.root {
-            Self::visit_recursive(root, &mut callback, self.x0, self.y0, self.x1, self.y1);
+        self.cover(ex0, ey0);
+        self.cover(ex1, ey1);
+        for i in 0..n {
+            if self.xs[i].is_finite() && self.ys[i].is_finite() {
+                self.add(i);
+            }
         }
     }
 
-    fn visit_recursive<F>(
-        node: &Box<QuadNode>,
-        callback: &mut F,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-    ) where
-        F: FnMut(&QuadNode, f32, f32, f32, f32) -> bool,
-    {
-        // Visit this node first
-        let skip_children = callback(node.as_ref(), x0, y0, x1, y1);
-
-        if !skip_children {
-            if let QuadNode::Internal { children, .. } = node.as_ref() {
-                for i in 0..4 {
-                    if let Some(ref child) = children[i] {
-                        let (cx0, cy0, cx1, cy1) = Self::quadrant_bounds(x0, y0, x1, y1, i);
-                        Self::visit_recursive(child, callback, cx0, cy0, cx1, cy1);
+    /// Grow the root square to contain a point (`cover.js`). Only called
+    /// while the tree is still empty, so there is never a root to re-parent.
+    fn cover(&mut self, x: Real, y: Real) {
+        let (mut x0, mut y0, mut x1, mut y1) = (self.x0, self.y0, self.x1, self.y1);
+        if x0.is_nan() {
+            // Integer extent, so that doubling never moves a cell boundary.
+            x0 = x.floor();
+            x1 = x0 + 1.0;
+            y0 = y.floor();
+            y1 = y0 + 1.0;
+        } else {
+            let mut z = x1 - x0;
+            if !(z != 0.0) {
+                z = 1.0;
+            }
+            while x0 > x || x >= x1 || y0 > y || y >= y1 {
+                let i = ((y < y0) as u8) << 1 | (x < x0) as u8;
+                z *= 2.0;
+                match i {
+                    0 => {
+                        x1 = x0 + z;
+                        y1 = y0 + z;
+                    }
+                    1 => {
+                        x0 = x1 - z;
+                        y1 = y0 + z;
+                    }
+                    2 => {
+                        x1 = x0 + z;
+                        y0 = y1 - z;
+                    }
+                    _ => {
+                        x0 = x1 - z;
+                        y0 = y1 - z;
                     }
                 }
-            }
-        }
-    }
-}
-
-/// Accumulate center of mass and total strength for Barnes-Hut
-/// This is called via visitAfter
-pub fn accumulate(node: &mut QuadNode, strengths: &[f32]) {
-    match node {
-        QuadNode::Internal { children, x, y, value, .. } => {
-            let mut strength = 0.0f32;
-            let mut weight = 0.0f32;
-            let mut cx = 0.0f32;
-            let mut cy = 0.0f32;
-
-            for child in children.iter() {
-                if let Some(c) = child {
-                    let c_value = c.get_value();
-                    let c_weight = c_value.abs();
-                    if c_weight > 0.0 {
-                        strength += c_value;
-                        weight += c_weight;
-                        cx += c_weight * c.get_x();
-                        cy += c_weight * c.get_y();
-                    }
-                }
-            }
-
-            if weight > 0.0 {
-                *x = cx / weight;
-                *y = cy / weight;
-            }
-            *value = strength;
-        }
-        QuadNode::Leaf { index, x: px, y: py, value, next, .. } => {
-            // Leaf: accumulate from linked list
-            let mut strength = if *index < strengths.len() {
-                strengths[*index]
-            } else {
-                0.0
-            };
-
-            // Follow linked list
-            let mut current = next.as_ref();
-            while let Some(n) = current {
-                if let QuadNode::Leaf { index: ni, next: nn, .. } = n.as_ref() {
-                    if *ni < strengths.len() {
-                        strength += strengths[*ni];
-                    }
-                    current = nn.as_ref();
-                } else {
+                if !z.is_finite() {
                     break;
                 }
             }
+        }
+        self.x0 = x0;
+        self.y0 = y0;
+        self.x1 = x1;
+        self.y1 = y1;
+    }
 
-            *value = strength;
-            // x, y already set to point position
+    fn new_internal(&mut self) -> u32 {
+        self.children.push([NONE; 4]);
+        (self.children.len() - 1) as u32
+    }
+
+    /// Insert point `i` (`add.js`).
+    fn add(&mut self, i: usize) {
+        let x = self.xs[i];
+        let y = self.ys[i];
+        let new_leaf = leaf(i);
+
+        if self.root == NONE {
+            self.root = new_leaf;
+            return;
+        }
+
+        let (mut x0, mut y0, mut x1, mut y1) = (self.x0, self.y0, self.x1, self.y1);
+        let mut node = self.root;
+        let mut parent = NONE;
+        let mut slot = 0usize;
+
+        // Walk down to the leaf the new point lands on, or to an empty slot.
+        while !is_leaf(node) {
+            let xm = (x0 + x1) / 2.0;
+            let ym = (y0 + y1) / 2.0;
+            let right = x >= xm;
+            let bottom = y >= ym;
+            if right {
+                x0 = xm;
+            } else {
+                x1 = xm;
+            }
+            if bottom {
+                y0 = ym;
+            } else {
+                y1 = ym;
+            }
+            parent = node;
+            slot = (bottom as usize) << 1 | right as usize;
+            node = self.children[parent as usize][slot];
+            if node == NONE {
+                self.children[parent as usize][slot] = new_leaf;
+                return;
+            }
+        }
+
+        // Exactly coincident with the point already there: chain, newest first.
+        let p = leaf_point(node);
+        let xp = self.xs[p];
+        let yp = self.ys[p];
+        if x == xp && y == yp {
+            self.next[i] = p as u32;
+            self.replace(parent, slot, new_leaf);
+            return;
+        }
+
+        // Otherwise split until the old and the new point part company.
+        let mut depth = 0;
+        loop {
+            let k = self.new_internal();
+            self.replace(parent, slot, k);
+            parent = k;
+
+            let xm = (x0 + x1) / 2.0;
+            let ym = (y0 + y1) / 2.0;
+            let right = x >= xm;
+            let bottom = y >= ym;
+            if right {
+                x0 = xm;
+            } else {
+                x1 = xm;
+            }
+            if bottom {
+                y0 = ym;
+            } else {
+                y1 = ym;
+            }
+            slot = (bottom as usize) << 1 | right as usize;
+            let old_slot = ((yp >= ym) as usize) << 1 | (xp >= xm) as usize;
+            if slot != old_slot {
+                self.children[k as usize][old_slot] = node;
+                self.children[k as usize][slot] = new_leaf;
+                return;
+            }
+            depth += 1;
+            if depth >= MAX_SPLIT_DEPTH {
+                // Cannot be separated at this precision: treat as coincident.
+                self.next[i] = p as u32;
+                self.children[k as usize][slot] = new_leaf;
+                return;
+            }
+        }
+    }
+
+    fn replace(&mut self, parent: u32, slot: usize, with: u32) {
+        if parent == NONE {
+            self.root = with;
+        } else {
+            self.children[parent as usize][slot] = with;
+        }
+    }
+
+    /// Fill `pre_order` with every internal node, parents before children.
+    pub fn order(&mut self) {
+        self.pre_order.clear();
+        if self.root == NONE || is_leaf(self.root) {
+            return;
+        }
+        self.pre_order.push(self.root);
+        let mut at = 0;
+        while at < self.pre_order.len() {
+            let k = self.pre_order[at] as usize;
+            at += 1;
+            for c in self.children[k] {
+                if c != NONE && !is_leaf(c) {
+                    self.pre_order.push(c);
+                }
+            }
+        }
+    }
+
+    /// Pre-order traversal (`visit.js`). The callback gets a node reference
+    /// and its square, and returns true to skip that node's children.
+    #[inline]
+    pub fn visit<F>(&self, stack: &mut Vec<Quad>, mut callback: F)
+    where
+        F: FnMut(u32, Real, Real, Real, Real) -> bool,
+    {
+        stack.clear();
+        if self.root == NONE {
+            return;
+        }
+        stack.push(Quad { node: self.root, x0: self.x0, y0: self.y0, x1: self.x1, y1: self.y1 });
+        while let Some(q) = stack.pop() {
+            if !callback(q.node, q.x0, q.y0, q.x1, q.y1) && !is_leaf(q.node) {
+                let xm = (q.x0 + q.x1) / 2.0;
+                let ym = (q.y0 + q.y1) / 2.0;
+                let ch = &self.children[q.node as usize];
+                if ch[3] != NONE {
+                    stack.push(Quad { node: ch[3], x0: xm, y0: ym, x1: q.x1, y1: q.y1 });
+                }
+                if ch[2] != NONE {
+                    stack.push(Quad { node: ch[2], x0: q.x0, y0: ym, x1: xm, y1: q.y1 });
+                }
+                if ch[1] != NONE {
+                    stack.push(Quad { node: ch[1], x0: xm, y0: q.y0, x1: q.x1, y1: ym });
+                }
+                if ch[0] != NONE {
+                    stack.push(Quad { node: ch[0], x0: q.x0, y0: q.y0, x1: xm, y1: ym });
+                }
+            }
         }
     }
 }
