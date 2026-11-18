@@ -1,0 +1,28 @@
+[package]
+name = "force-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance force simulation kernel in WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["console_error_panic_hook"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+
+# For better error messages in debug builds
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# For logging to browser console
+web-sys = { version = "0.3", features = ["console"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+# Optimize for size and speed
+opt-level = 3
+lto = true
