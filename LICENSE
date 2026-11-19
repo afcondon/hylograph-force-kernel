@@ -28,10 +28,6 @@ tick of the simulation, in src/forces.rs and src/lib.rs) and from the part
 of d3-quadtree 3.0.1 that d3-force uses (src/quadtree.rs). Both are
 licensed under the ISC License:
 
-ISC License:
-
-ISC License:
-
 ISC License
 
 Copyright 2010-2021 Mike Bostock
