@@ -2,7 +2,10 @@
 name = "force-kernel"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance force simulation kernel in WebAssembly"
+description = "d3-force's forces and six more, as a deterministic force simulation kernel for WebAssembly"
+license = "MIT AND ISC"
+repository = "https://github.com/afcondon/hylograph-force-kernel"
+readme = "README.md"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
