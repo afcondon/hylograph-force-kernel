@@ -52,8 +52,9 @@ cargo test                   # 127 tests, 32-bit
 cargo test --features f64    # 63 tests, 64-bit
 ```
 
-The tests hold every force to a plain, slow reference implementation in
-`src/reference.rs`.
+The six forces that are not d3's are held to a plain, slow reference
+implementation in `src/reference.rs`. The d3 forces are held to d3 itself,
+below.
 
 ## What it agrees with, and how that is checked
 
