@@ -1019,7 +1019,17 @@ fn per_element_setters_refuse_the_wrong_kind_of_force() {
     assert!(!sim.set_force_mask(directional, &[1, 1]));
 
     assert!(!sim.set_force_half_widths(towards, &two));
-    assert!(!sim.set_force_half_heights(contain, &two));
+    assert!(sim.set_force_half_heights(contain, &two));
+    assert!(sim.set_force_half_widths(contain, &two));
+    assert!(!sim.set_force_half_heights(cohesion, &two));
+    assert!(sim.set_force_groups(rects, &[0, 0]));
+    assert!(!sim.set_rect_collide_pairs(contain, 1));
+    assert!(!sim.set_rect_collide_pairs(rects, 3));
+    assert!(sim.set_rect_collide_pairs(rects, 2));
+    assert!(!sim.set_rect_collide_through(towards, true));
+    assert!(sim.set_rect_collide_through(rects, true));
+    assert!(!sim.set_directional_hard(rects, true));
+    assert!(sim.set_directional_hard(directional, true));
     assert!(!sim.set_force_gaps(rects, &two));
     assert!(!sim.set_force_regions(cohesion, &[0, 0]));
     assert!(!sim.set_force_groups(towards, &[0, 0]));
@@ -1376,8 +1386,370 @@ fn the_collide_options_are_refused_by_other_forces() {
     assert!(!sim.set_collide_alpha_scaled(rects, true));
     assert!(!sim.set_collide_alpha_scaled(99, true));
     assert!(!sim.set_collide_filter(towards, &[1, 1]));
-    assert!(!sim.set_collide_filter(rects, &[1, 1]));
+    assert!(sim.set_collide_filter(rects, &[1, 1])); // rectangle collision takes the filter too
     assert!(!sim.set_force_mask(bump, &[1, 1]));
     assert!(sim.set_collide_filter(bump, &[1, 1]));
     assert!(sim.set_collide_alpha_scaled(bump, true));
+}
+
+// ----------------------------------------------------------------------
+// Rectangle collision: holds, who collides, the squeeze
+// ----------------------------------------------------------------------
+
+#[test]
+fn a_pinned_rectangle_does_not_move_and_the_other_takes_the_whole_push() {
+    // A big label on a small pinned dot: by area the label would take a
+    // sliver of the overlap and never clear the dot.
+    let mut sim = bare(&[(0.0, 0.0), (0.0, 8.0)]);
+    sim.fix_node(0, 0.0, 0.0);
+    let id = sim.add_rect_collide(1.0, 1.0, 1.0, 1);
+    sim.set_force_half_widths(id, &[2.0, 40.0]);
+    sim.set_force_half_heights(id, &[2.0, 7.0]);
+    apply(&mut sim, id, 1.0);
+    // Overlap in y: (2 + 7) - 8 = 1, all of it the label's.
+    assert_exact(&velocities(&sim), &[(0.0, 0.0), (0.0, 1.0)]);
+
+    // Pinned on x only: held on x, free on y, where it shares by area.
+    let mut sim = bare(&[(0.0, 0.0), (0.0, 8.0)]);
+    sim.set_fixed(&[0.0, Real::NAN, Real::NAN, Real::NAN]);
+    let id = sim.add_rect_collide(1.0, 1.0, 1.0, 1);
+    sim.set_force_half_widths(id, &[2.0, 6.0]);
+    sim.set_force_half_heights(id, &[2.0, 7.0]);
+    apply(&mut sim, id, 1.0);
+    // Areas 4 and 42: the small one takes 42/46 of the overlap of 1.
+    assert_exact(&velocities(&sim), &[(0.0, -(42.0 as Real / 46.0)), (0.0, 4.0 as Real / 46.0)]);
+}
+
+#[test]
+fn a_filter_and_groups_choose_which_rectangles_collide() {
+    // Three coincident-ish squares in a row, all overlapping.
+    let points = [(0.0, 0.0), (6.0, 0.0), (12.0, 0.0)];
+    let fresh = |points: &[Point]| {
+        let mut sim = bare(points);
+        let id = sim.add_rect_collide(5.0, 5.0, 1.0, 1);
+        (sim, id)
+    };
+    // Node 1 left out: 0 and 2 do not overlap (12 apart, 10 wide), so nothing.
+    let (mut sim, id) = fresh(&points);
+    assert!(sim.set_collide_filter(id, &[1, 0, 1]));
+    apply(&mut sim, id, 1.0);
+    assert_exact(&velocities(&sim), &[(0.0, 0.0); 3]);
+    // Within groups {0, 1} and {2}: only 0 and 1 collide, 2 each.
+    let (mut sim, id) = fresh(&points);
+    assert!(sim.set_force_groups(id, &[0, 0, 1]));
+    assert!(sim.set_rect_collide_pairs(id, 1));
+    apply(&mut sim, id, 1.0);
+    assert_exact(&velocities(&sim), &[(-2.0, 0.0), (2.0, 0.0), (0.0, 0.0)]);
+    // Between groups: only 1 and 2 collide; a node in no group is in a
+    // different group from everyone.
+    let (mut sim, id) = fresh(&points);
+    assert!(sim.set_force_groups(id, &[0, 0, 1]));
+    assert!(sim.set_rect_collide_pairs(id, 2));
+    apply(&mut sim, id, 1.0);
+    assert_exact(&velocities(&sim), &[(0.0, 0.0), (-2.0, 0.0), (2.0, 0.0)]);
+    let (mut sim, id) = fresh(&points);
+    assert!(sim.set_force_groups(id, &[NONE_ID, NONE_ID, NONE_ID]));
+    assert!(sim.set_rect_collide_pairs(id, 1));
+    apply(&mut sim, id, 1.0);
+    assert_exact(&velocities(&sim), &[(0.0, 0.0); 3]);
+}
+
+#[test]
+fn a_squeezed_rectangle_goes_through_one_side() {
+    // A wide label between two pinned dots, one above and one below.
+    let points = [(0.0, -6.0), (0.0, 7.0), (3.0, 0.0)];
+    let build = |through: bool, vy: Real| {
+        let mut sim = bare(&points);
+        sim.fix_node(0, 0.0, -6.0);
+        sim.fix_node(1, 0.0, 7.0);
+        sim.set_velocity(2, 0.0, vy);
+        let id = sim.add_rect_collide(1.0, 1.0, 1.0, 1);
+        sim.set_force_half_widths(id, &[2.0, 2.0, 30.0]);
+        sim.set_force_half_heights(id, &[2.0, 2.0, 6.0]);
+        assert!(sim.set_rect_collide_through(id, through));
+        apply(&mut sim, id, 1.0);
+        velocities(&sim)[2]
+    };
+    // Overlaps: 2 with the dot above (pushing down), 1 with the one below.
+    assert_eq!(build(false, 0.0), (0.0, 1.0)); // wedged: the pushes all but cancel
+    assert_eq!(build(true, 0.0), (0.0, 2.0)); // at rest: with the stronger side, down
+    // Moving up fast enough to count, it keeps going up, through the dot
+    // above: its velocity -0.5 anticipates overlaps 2.5 and 0.5.
+    assert_eq!(build(true, -0.5), (0.0, -0.5 - 0.5));
+    // A velocity under a thousandth of the pushes is not a movement.
+    assert_close(build(true, -0.001).1, 2.0, 1e-5);
+}
+
+#[test]
+fn rectangle_collision_with_holds_groups_and_the_squeeze_matches_the_reference_exactly() {
+    for (n, side, iterations, seed, pairs, through) in [
+        (300usize, 150.0 as Real, 3u32, 61u64, 0u8, true),
+        (300, 150.0, 1, 62, 0, false),
+        (200, 60.0, 4, 63, 2, true),
+        (200, 60.0, 2, 64, 1, true),
+        (120, 20.0, 4, 65, 0, true), // crowded wide boxes
+    ] {
+        let mut points = cloud(n, side, seed);
+        points[7] = points[3];
+        points[11].0 = points[5].0;
+        let half_widths: Vec<Real> = (0..n).map(|i| if i % 5 == 0 { 2.0 } else { 12.0 + (i % 7) as Real * 4.0 }).collect();
+        let half_heights: Vec<Real> = (0..n).map(|i| if i % 5 == 0 { 2.0 } else { 4.0 }).collect();
+        let held: Vec<(bool, bool)> = (0..n).map(|i| (i % 5 == 0 || i % 17 == 3, i % 5 == 0 || i % 19 == 4)).collect();
+        let included: Vec<bool> = (0..n).map(|i| i % 13 != 6).collect();
+        let groups: Vec<Option<u32>> = (0..n).map(|i| if i % 11 == 0 { None } else { Some((i % 3) as u32) }).collect();
+        let mut sim = bare(&points);
+        let v = give_velocities(&mut sim, 6.0, seed + 100);
+        let mut fixed = vec![Real::NAN; n * 2];
+        for i in 0..n {
+            if held[i].0 {
+                fixed[i * 2] = points[i].0;
+            }
+            if held[i].1 {
+                fixed[i * 2 + 1] = points[i].1;
+            }
+        }
+        sim.set_fixed(&fixed);
+        let id = sim.add_rect_collide(1.0, 1.0, 0.9, iterations);
+        sim.set_force_half_widths(id, &half_widths);
+        sim.set_force_half_heights(id, &half_heights);
+        assert!(sim.set_collide_filter(id, &included.iter().map(|&b| b as u8).collect::<Vec<_>>()));
+        assert!(sim.set_force_groups(id, &groups.iter().map(|g| g.unwrap_or(NONE_ID)).collect::<Vec<_>>()));
+        assert!(sim.set_rect_collide_pairs(id, pairs));
+        assert!(sim.set_rect_collide_through(id, through));
+        apply(&mut sim, id, 1.0);
+        let options = reference::RectOptions {
+            held: &held,
+            included: &included,
+            groups: &groups,
+            pairs: [Pairs::All, Pairs::SameGroup, Pairs::DifferentGroups][pairs as usize],
+            through,
+        };
+        let expected = reference::rect_collide_with(&points, &v, &half_widths, &half_heights, 0.9, iterations, &options);
+        let touched = expected.iter().zip(&v).filter(|(a, b)| a != b).count();
+        assert!(touched > n / 4, "only {touched} of {n} rectangles collide in this layout");
+        assert_exact(&velocities(&sim), &expected);
+        // A held coordinate was not touched.
+        for i in 0..n {
+            if held[i].0 {
+                assert_eq!(velocities(&sim)[i].0.to_bits(), v[i].0.to_bits());
+            }
+            if held[i].1 {
+                assert_eq!(velocities(&sim)[i].1.to_bits(), v[i].1.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
+fn crowded_wide_boxes_among_pinned_dots_come_apart_with_the_squeeze_and_not_without() {
+    // Labels start on their dots; nothing else acts. Wedged, some never
+    // clear; going through, all do.
+    let dots = 60;
+    let run = |through: bool| {
+        let mut points = cloud(dots, 260.0, 71);
+        let labels: Vec<Point> = points.iter().map(|&(x, y)| (x + 20.0, y)).collect();
+        points.extend(labels);
+        let n = points.len();
+        let mut sim = bare(&points);
+        for i in 0..dots {
+            sim.fix_node(i, points[i].0, points[i].1);
+        }
+        let half_widths: Vec<Real> = (0..n).map(|i| if i < dots { 3.0 } else { 14.0 + (i % 5) as Real * 5.0 }).collect();
+        let half_heights: Vec<Real> = (0..n).map(|i| if i < dots { 3.0 } else { 6.0 }).collect();
+        let id = sim.add_rect_collide(1.0, 1.0, 1.0, 4);
+        sim.set_force_half_widths(id, &half_widths);
+        sim.set_force_half_heights(id, &half_heights);
+        sim.set_rect_collide_through(id, through);
+        sim.set_velocity_retention(0.4);
+        for _ in 0..3000 {
+            sim.tick();
+        }
+        let p = positions(&sim);
+        let mut overlapping = 0;
+        for i in dots..n {
+            for j in 0..n {
+                // Half a pixel of grace: the last of an overlap dies away geometrically.
+                if j != i
+                    && (half_widths[i] + half_widths[j]) - (p[i].0 - p[j].0).abs() > 0.5
+                    && (half_heights[i] + half_heights[j]) - (p[i].1 - p[j].1).abs() > 0.5
+                {
+                    overlapping += 1;
+                }
+            }
+        }
+        overlapping
+    };
+    assert!(run(false) > 0, "the wedge this test is about did not happen");
+    assert_eq!(run(true), 0);
+}
+
+// ----------------------------------------------------------------------
+// Containment of a rectangle
+// ----------------------------------------------------------------------
+
+#[test]
+fn a_rectangle_is_kept_inside_by_its_half_extents() {
+    let rect = Region::rect(0.0, 0.0, 100.0, 50.0);
+    assert_eq!(rect.project_body(0.0, 20.0, 5.0, 95.0, 48.0), (80.0, 45.0));
+    assert_eq!(rect.project_body(1.0, 20.0, 5.0, -5.0, 25.0), (21.0, 25.0));
+    assert_eq!(rect.project_body(0.0, 60.0, 5.0, 10.0, 25.0), (50.0, 25.0)); // too wide: middle
+    let circle = Region::Circle { x: 0.0, y: 0.0, r: 50.0 };
+    // A 30 by 40 rectangle (half-extents 15, 20) has a circle of radius 25 round it.
+    assert_eq!(circle.project_body(0.0, 15.0, 20.0, 40.0, 0.0), (25.0, 0.0));
+    // A square region as a polygon agrees with the rectangle.
+    let square = Region::polygon(&[0.0, 0.0, 100.0, 0.0, 100.0, 50.0, 0.0, 50.0]);
+    assert_eq!(square.project_body(0.0, 20.0, 5.0, 95.0, 48.0), (80.0, 45.0));
+    // With no half-extents it is the circle rule, bit for bit.
+    let mut rng = TestRng(81);
+    for _ in 0..200 {
+        let (x, y, r) = (rng.next() * 200.0 - 50.0, rng.next() * 200.0 - 50.0, rng.next() * 30.0);
+        for region in [&rect, &circle, &square] {
+            assert_exact(&[region.project_body(r, 0.0, 0.0, x, y)], &[region.project(r, x, y)]);
+        }
+    }
+}
+
+#[test]
+fn containment_with_half_extents_matches_the_reference_exactly() {
+    let shapes = [
+        Shape::Rect(-80.0, -40.0, 90.0, 60.0),
+        Shape::Circle(5.0, -5.0, 70.0),
+        Shape::Polygon(vec![(-90.0, 0.0), (0.0, -70.0), (90.0, 0.0), (0.0, 70.0)]),
+    ];
+    let n = 240;
+    let points = cloud(n, 400.0, 82);
+    let radii: Vec<Real> = (0..n).map(|i| (i % 3) as Real).collect();
+    let half_widths: Vec<Real> = (0..n).map(|i| (i % 5) as Real * 6.0).collect();
+    let half_heights: Vec<Real> = (0..n).map(|i| (i % 4) as Real * 3.0).collect();
+    let regions: Vec<u32> = (0..n).map(|i| (i % 3) as u32).collect();
+    let mut sim = bare(&points);
+    let v = give_velocities(&mut sim, 10.0, 83);
+    let id = sim.add_containment(0.6, true);
+    for shape in &shapes {
+        match shape {
+            Shape::Rect(x0, y0, x1, y1) => sim.containment_add_rect(id, *x0, *y0, *x1, *y1),
+            Shape::Circle(x, y, r) => sim.containment_add_circle(id, *x, *y, *r),
+            Shape::Polygon(vertices) => {
+                sim.containment_add_polygon(id, &vertices.iter().flat_map(|&(x, y)| [x, y]).collect::<Vec<_>>())
+            }
+        };
+    }
+    assert!(sim.set_force_regions(id, &regions));
+    assert!(sim.set_force_radii(id, &radii));
+    assert!(sim.set_force_half_widths(id, &half_widths));
+    assert!(sim.set_force_half_heights(id, &half_heights));
+    // Soft.
+    apply(&mut sim, id, 1.0);
+    let mut expected = v.clone();
+    for i in 0..n {
+        let a = (points[i].0 + v[i].0, points[i].1 + v[i].1);
+        let c = reference::project_body(&shapes[i % 3], radii[i], half_widths[i], half_heights[i], a);
+        expected[i].0 += (c.0 - a.0) * 0.6;
+        expected[i].1 += (c.1 - a.1) * 0.6;
+    }
+    assert_exact(&velocities(&sim), &expected);
+    // Hard: every body ends inside (for the rectangle region, exactly).
+    assert!(sim.forces[id as usize].constrain(&mut sim.state));
+    let p = positions(&sim);
+    for i in 0..n {
+        let c = reference::project_body(&shapes[i % 3], radii[i], half_widths[i], half_heights[i], points[i]);
+        assert_exact(&[p[i]], &[c]);
+        if i % 3 == 0 {
+            let (w, h) = (radii[i] + half_widths[i], radii[i] + half_heights[i]);
+            assert!(p[i].0 - w >= -80.0 && p[i].0 + w <= 90.0 && p[i].1 - h >= -40.0 && p[i].1 + h <= 60.0);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// The hard directional constraint
+// ----------------------------------------------------------------------
+
+#[test]
+fn a_hard_directional_constraint_keeps_the_gap_asked_for() {
+    // Parent above child by 10; 78 is asked for.
+    let mut sim = bare(&[(0.0, 0.0), (5.0, 10.0), (-5.0, 12.0)]);
+    sim.set_links(&[0, 1, 1, 2]);
+    let id = sim.add_directional(78.0, 0.0, 1.0, 0.0, 1);
+    assert!(!sim.forces[id as usize].constrain(&mut sim.state)); // soft only: no projection
+    assert!(sim.set_directional_hard(id, true));
+    assert!(sim.forces[id as usize].constrain(&mut sim.state));
+    assert_exact(&positions(&sim), &[(0.0, 0.0), (5.0, 78.0), (-5.0, 156.0)]);
+    assert_exact(&velocities(&sim), &[(0.0, 0.0), (0.0, 68.0), (0.0, 144.0)]);
+
+    // A pinned target stays, and the source goes back instead; both pinned,
+    // nothing moves. A pin on x does not hold a node against a vertical axis.
+    let mut sim = bare(&[(0.0, 0.0), (5.0, 10.0), (9.0, 0.0), (9.0, 10.0), (20.0, 0.0), (20.0, 10.0)]);
+    sim.set_links(&[0, 1, 2, 3, 4, 5]);
+    sim.fix_node(1, 5.0, 10.0);
+    sim.fix_node(2, 9.0, 0.0);
+    sim.fix_node(3, 9.0, 10.0);
+    sim.set_fixed(&{
+        let mut fixed = sim.state.fixed.clone();
+        fixed[5 * 2] = 20.0; // x only
+        fixed
+    });
+    let id = sim.add_directional(30.0, 0.0, 1.0, 0.0, 1);
+    sim.set_directional_hard(id, true);
+    sim.forces[id as usize].constrain(&mut sim.state);
+    assert_exact(&positions(&sim), &[(0.0, -20.0), (5.0, 10.0), (9.0, 0.0), (9.0, 10.0), (20.0, 0.0), (20.0, 30.0)]);
+}
+
+#[test]
+fn the_hard_directional_constraint_matches_the_reference_and_survives_the_forces() {
+    let n = 200;
+    let points = cloud(n, 300.0, 91);
+    let mut links = Vec::new();
+    for i in 1..n {
+        links.push(((i - 1) / 3, i));
+        if i % 10 == 0 {
+            links.push(((i * 7) % n, i)); // a second parent for some
+        }
+    }
+    let links: Vec<(usize, usize)> = links.into_iter().filter(|(s, t)| s != t).collect();
+    let gaps: Vec<Real> = (0..links.len()).map(|i| 20.0 + (i % 4) as Real * 15.0).collect();
+    let held: Vec<(bool, bool)> = (0..n).map(|i| (i % 9 == 2, i % 7 == 3)).collect();
+    let flat: Vec<u32> = links.iter().flat_map(|&(s, t)| [s as u32, t as u32]).collect();
+    for axis in [(0.0 as Real, 1.0 as Real), (1.0, 2.0)] {
+        let len = (axis.0 * axis.0 + axis.1 * axis.1).sqrt();
+        let unit = if len == 1.0 { axis } else { (axis.0 / len, axis.1 / len) };
+        let mut sim = bare(&points);
+        let v = give_velocities(&mut sim, 5.0, 92);
+        sim.set_links(&flat);
+        let mut fixed = vec![Real::NAN; n * 2];
+        for i in 0..n {
+            if held[i].0 {
+                fixed[i * 2] = points[i].0;
+            }
+            if held[i].1 {
+                fixed[i * 2 + 1] = points[i].1;
+            }
+        }
+        sim.set_fixed(&fixed);
+        let id = sim.add_directional(1.0, axis.0, axis.1, 0.0, 1);
+        assert!(sim.set_force_gaps(id, &gaps));
+        assert!(sim.set_directional_hard(id, true));
+        assert!(sim.forces[id as usize].constrain(&mut sim.state));
+        let (p, w) = reference::directional_hard(&points, &v, &links, &gaps, unit, &held);
+        assert_exact(&positions(&sim), &p);
+        assert_exact(&velocities(&sim), &w);
+    }
+
+    // In a running simulation with charge pushing the other way, every link
+    // of a tree (no pins, one parent each) keeps its gap at every tick.
+    let tree: Vec<(usize, usize)> = (1..n).map(|i| ((i - 1) / 3, i)).collect();
+    let mut sim = bare(&points);
+    sim.set_links(&tree.iter().flat_map(|&(s, t)| [s as u32, t as u32]).collect::<Vec<_>>());
+    sim.add_many_body(-60.0, 0.9, 1.0, Real::INFINITY as f64);
+    sim.add_links(20.0, 0.7, 1);
+    let id = sim.add_directional(40.0, 0.0, 1.0, 0.0, 1);
+    sim.set_directional_hard(id, true);
+    for _ in 0..120 {
+        sim.tick();
+        let p = positions(&sim);
+        for &(s, t) in &tree {
+            let d = p[t].1 - p[s].1;
+            assert!(d >= 40.0 - 1e-3, "link {s} -> {t} keeps {d}");
+        }
+    }
 }

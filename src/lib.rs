@@ -544,7 +544,7 @@ impl Simulation {
     #[wasm_bindgen]
     pub fn set_collide_filter(&mut self, id: u32, mask: &[u8]) -> bool {
         match self.forces.get_mut(id as usize) {
-            Some(force) if matches!(force.kind, Kind::Collide { .. }) => {
+            Some(force) if matches!(force.kind, Kind::Collide { .. } | Kind::RectCollide { .. }) => {
                 force.mask = Some(mask.to_vec());
                 true
             }
@@ -593,12 +593,13 @@ impl Simulation {
         self.push_force(Force::rect_collide(half_width, half_height, strength, iterations))
     }
 
-    /// Give a rectangle collision force one half-width per node. Returns
-    /// false for any other force.
+    /// Give a rectangle collision force one half-width per node, or a
+    /// containment force the half-width of each node's body (default 0: a
+    /// circle of its radius). Returns false for any other force.
     #[wasm_bindgen]
     pub fn set_force_half_widths(&mut self, id: u32, half_widths: &[Real]) -> bool {
         match self.forces.get_mut(id as usize) {
-            Some(Force { kind: Kind::RectCollide { half_width, .. }, .. }) => {
+            Some(Force { kind: Kind::RectCollide { half_width, .. } | Kind::Contain { half_width, .. }, .. }) => {
                 *half_width = Per::Each(half_widths.to_vec());
                 true
             }
@@ -606,13 +607,50 @@ impl Simulation {
         }
     }
 
-    /// Give a rectangle collision force one half-height per node. Returns
-    /// false for any other force.
+    /// Give a rectangle collision force one half-height per node, or a
+    /// containment force the half-height of each node's body. Returns false
+    /// for any other force.
     #[wasm_bindgen]
     pub fn set_force_half_heights(&mut self, id: u32, half_heights: &[Real]) -> bool {
         match self.forces.get_mut(id as usize) {
-            Some(Force { kind: Kind::RectCollide { half_height, .. }, .. }) => {
+            Some(Force { kind: Kind::RectCollide { half_height, .. } | Kind::Contain { half_height, .. }, .. }) => {
                 *half_height = Per::Each(half_heights.to_vec());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Restrict a rectangle collision by group (set the groups with
+    /// `set_force_groups`): 0 = every pair, 1 = only two nodes of the same
+    /// group, 2 = only two nodes not of the same group. A node filter is set
+    /// with `set_collide_filter`. Returns false for any other force or any
+    /// other number.
+    #[wasm_bindgen]
+    pub fn set_rect_collide_pairs(&mut self, id: u32, pairs: u8) -> bool {
+        let scope = match pairs {
+            0 => Scope::All,
+            1 => Scope::Within,
+            2 => Scope::Between,
+            _ => return false,
+        };
+        match self.forces.get_mut(id as usize) {
+            Some(Force { kind: Kind::RectCollide { pairs: current, .. }, .. }) => {
+                *current = scope;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What a rectangle pushed from both sides does: false (the default), it
+    /// stays where the pushes cancel; true, it goes through one side (THE
+    /// SQUEEZE, on `apply_rect_collide`). Returns false for any other force.
+    #[wasm_bindgen]
+    pub fn set_rect_collide_through(&mut self, id: u32, through: bool) -> bool {
+        match self.forces.get_mut(id as usize) {
+            Some(Force { kind: Kind::RectCollide { through: current, .. }, .. }) => {
+                *current = through;
                 true
             }
             _ => false,
@@ -683,13 +721,13 @@ impl Simulation {
         self.push_force(Force::cohesion(strength))
     }
 
-    /// Give a cohesion or many-body force one group id per node
+    /// Give a cohesion, many-body or rectangle collision force one group id per node
     /// (0xFFFFFFFF, or past the end of the array: in no group). Returns
     /// false for any other force.
     #[wasm_bindgen]
     pub fn set_force_groups(&mut self, id: u32, groups: &[u32]) -> bool {
         match self.forces.get_mut(id as usize) {
-            Some(force) if matches!(force.kind, Kind::Cohesion | Kind::ManyBody { .. }) => {
+            Some(force) if matches!(force.kind, Kind::Cohesion | Kind::ManyBody { .. } | Kind::RectCollide { .. }) => {
                 force.groups = Some(groups.to_vec());
                 true
             }
@@ -725,6 +763,21 @@ impl Simulation {
     #[wasm_bindgen]
     pub fn add_directional(&mut self, gap: Real, axis_x: Real, axis_y: Real, strength: Real, iterations: u32) -> u32 {
         self.push_force(Force::directional(gap, axis_x, axis_y, strength, iterations))
+    }
+
+    /// Make a directional constraint hard: after integration its links are
+    /// projected so that the gap asked for is the gap kept (HARD DIRECTIONAL
+    /// CONSTRAINT, on `Force::constrain`). The soft force still applies
+    /// unless its strength is 0. Returns false for any other force.
+    #[wasm_bindgen]
+    pub fn set_directional_hard(&mut self, id: u32, hard: bool) -> bool {
+        match self.forces.get_mut(id as usize) {
+            Some(Force { kind: Kind::Directional { hard: current, .. }, .. }) => {
+                *current = hard;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Give a directional constraint one gap per link, in the order of
@@ -1008,7 +1061,8 @@ impl Simulation {
         // Integrate positions
         self.integrate();
 
-        // Hard constraints, then pins again: a pin beats a region.
+        // Hard constraints, in the order of the forces, then pins again: a
+        // pin beats a region and a gap.
         let mut constrained = false;
         for force in &self.forces {
             constrained |= force.constrain(&mut self.state);

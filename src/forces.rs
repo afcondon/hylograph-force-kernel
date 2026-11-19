@@ -199,25 +199,42 @@ impl Region {
     }
 
     /// Where a circle of radius `r` centred on (x, y) has to move its centre
-    /// to, to lie inside the region. A centre already far enough inside is
-    /// returned unchanged (bit for bit).
-    ///
-    /// - Rect: clamp x to [x0 + r, x1 - r] and y to [y0 + r, y1 - r]. If the
-    ///   rectangle is narrower than 2r on an axis, that coordinate goes to the
-    ///   middle of the rectangle on that axis.
-    /// - Circle: with R' = max(R - r, 0), a centre further than R' from the
-    ///   region's centre c moves to c + (p - c) * (R' / |p - c|).
-    /// - Polygon: one pass visits the edges in order; for each, with d the
-    ///   signed distance from the (current) centre to the edge line, positive
-    ///   inside, a centre with d < r moves along the inward normal by r - d.
-    ///   Passes repeat until one moves nothing, at most `POLYGON_PASSES`
-    ///   times. (Projection onto each half-plane in turn: exact when one edge
-    ///   is violated, and it converges into the polygon at corners.)
+    /// to, to lie inside the region: `project_body` with no half-extents.
     pub fn project(&self, r: Real, x: Real, y: Real) -> (Real, Real) {
+        self.project_body(r, 0.0, 0.0, x, y)
+    }
+
+    /// THE BODY. A node is kept inside as a rectangle of half-width `w` and
+    /// half-height `h`, grown all round by a radius `r`: a circle when w and
+    /// h are zero, a plain rectangle when r is, a rounded rectangle
+    /// otherwise.
+    ///
+    /// Where such a body centred on (x, y) has to move its centre to, to lie
+    /// inside the region. A centre already far enough inside is returned
+    /// unchanged (bit for bit).
+    ///
+    /// - Rect: clamp x to [x0 + (r + w), x1 - (r + w)] and y to
+    ///   [y0 + (r + h), y1 - (r + h)]. If the rectangle is narrower than the
+    ///   body on an axis, that coordinate goes to the middle of the
+    ///   rectangle on that axis.
+    /// - Circle: the body counts as the circle round it, of radius
+    ///   r + sqrt(w*w + h*h) (exact for a round body, a little cautious for
+    ///   a rectangle). With R' = max(R - r - sqrt(w*w + h*h), 0), a centre
+    ///   further than R' from the region's centre c moves to
+    ///   c + (p - c) * (R' / |p - c|).
+    /// - Polygon: one pass visits the edges in order; for each, with inward
+    ///   unit normal n and d the signed distance from the (current) centre
+    ///   to the edge line, positive inside, the body reaches
+    ///   s = (r + |n.x| * w) + |n.y| * h towards the edge, and a centre with
+    ///   d < s moves along the normal by s - d. Passes repeat until one
+    ///   moves nothing, at most `POLYGON_PASSES` times. (Projection onto
+    ///   each half-plane in turn: exact when one edge is violated, and it
+    ///   converges into the polygon at corners.)
+    pub fn project_body(&self, r: Real, w: Real, h: Real, x: Real, y: Real) -> (Real, Real) {
         match self {
             Region::Rect { x0, y0, x1, y1 } => {
-                let clamp = |v: Real, lo: Real, hi: Real| {
-                    let (a, b) = (lo + r, hi - r);
+                let clamp = |v: Real, lo: Real, hi: Real, inset: Real| {
+                    let (a, b) = (lo + inset, hi - inset);
                     if a > b {
                         (lo + hi) / 2.0
                     } else if v < a {
@@ -228,10 +245,11 @@ impl Region {
                         v
                     }
                 };
-                (clamp(x, *x0, *x1), clamp(y, *y0, *y1))
+                (clamp(x, *x0, *x1, r + w), clamp(y, *y0, *y1, r + h))
             }
             Region::Circle { x: cx, y: cy, r: radius } => {
-                let inner = if *radius - r > 0.0 { *radius - r } else { 0.0 };
+                let reach = *radius - r - (w * w + h * h).sqrt();
+                let inner = if reach > 0.0 { reach } else { 0.0 };
                 let dx = x - cx;
                 let dy = y - cy;
                 let d2 = dx * dx + dy * dy;
@@ -248,9 +266,10 @@ impl Region {
                     let mut moved = false;
                     for &(px, py, nx, ny) in edges {
                         let d = (x - px) * nx + (y - py) * ny;
-                        if d < r {
-                            x += nx * (r - d);
-                            y += ny * (r - d);
+                        let reach = r + nx.abs() * w + ny.abs() * h;
+                        if d < reach {
+                            x += nx * (reach - d);
+                            y += ny * (reach - d);
                             moved = true;
                         }
                     }
@@ -264,6 +283,9 @@ impl Region {
     }
 }
 
+/// The most passes a hard directional constraint makes.
+pub const DIRECTIONAL_PASSES: usize = 32;
+
 pub enum Kind {
     /// `theta2`, `distance_min2`, `distance_max2` are stored squared, as d3 does.
     ManyBody { theta2: Real, distance_min2: Real, distance_max2: Real, scope: Scope },
@@ -276,13 +298,16 @@ pub enum Kind {
     Radial { radius: Per, x: Real, y: Real },
     /// `targets` is [tx0, ty0, tx1, ty1, ...].
     Towards { targets: Vec<Real> },
-    RectCollide { half_width: Per, half_height: Per, iterations: u32 },
+    /// `pairs`: which pairs collide, by `Force::groups`. `through`: a
+    /// squeezed rectangle goes through one side (see `apply_rect_collide`).
+    RectCollide { half_width: Per, half_height: Per, iterations: u32, pairs: Scope, through: bool },
     /// `assignment`: per node, an index into `regions` (`NONE_ID` = free).
     /// Without one, every node is in region 0.
-    Contain { regions: Vec<Region>, assignment: Option<Vec<u32>>, radius: Per, hard: bool },
+    Contain { regions: Vec<Region>, assignment: Option<Vec<u32>>, radius: Per, half_width: Per, half_height: Per, hard: bool },
     Cohesion,
     /// (`axis_x`, `axis_y`) is a unit vector.
-    Directional { gap: Per, axis_x: Real, axis_y: Real, iterations: u32 },
+    /// `hard`: also project the links after integration (see `constrain`).
+    Directional { gap: Per, axis_x: Real, axis_y: Real, iterations: u32, hard: bool },
 }
 
 pub struct Force {
@@ -368,6 +393,8 @@ impl Force {
                 half_width: Per::Uniform(half_width),
                 half_height: Per::Uniform(half_height),
                 iterations,
+                pairs: Scope::All,
+                through: false,
             },
             strength,
         )
@@ -375,7 +402,14 @@ impl Force {
 
     pub fn contain(strength: Real, hard: bool) -> Force {
         Force::new(
-            Kind::Contain { regions: Vec::new(), assignment: None, radius: Per::Uniform(0.0), hard },
+            Kind::Contain {
+                regions: Vec::new(),
+                assignment: None,
+                radius: Per::Uniform(0.0),
+                half_width: Per::Uniform(0.0),
+                half_height: Per::Uniform(0.0),
+                hard,
+            },
             strength,
         )
     }
@@ -388,7 +422,7 @@ impl Force {
     pub fn directional(gap: Real, axis_x: Real, axis_y: Real, strength: Real, iterations: u32) -> Force {
         let len = (axis_x * axis_x + axis_y * axis_y).sqrt();
         let (axis_x, axis_y) = if len > 0.0 && len.is_finite() { (axis_x / len, axis_y / len) } else { (0.0, 1.0) };
-        Force::new(Kind::Directional { gap: Per::Uniform(gap), axis_x, axis_y, iterations }, strength)
+        Force::new(Kind::Directional { gap: Per::Uniform(gap), axis_x, axis_y, iterations, hard: false }, strength)
     }
 
     /// Does this force take a strength per node (and therefore a mask)?
@@ -460,43 +494,122 @@ impl Force {
             }
             Kind::Radial { radius, x, y } => self.apply_radial(st, radius, *x, *y, alpha),
             Kind::Towards { targets } => self.apply_towards(st, targets, alpha),
-            Kind::RectCollide { half_width, half_height, iterations } => {
-                self.apply_rect_collide(st, half_width, half_height, *iterations)
+            Kind::RectCollide { half_width, half_height, iterations, pairs, through } => {
+                self.apply_rect_collide(st, half_width, half_height, *iterations, *pairs, *through)
             }
-            Kind::Contain { regions, assignment, radius, .. } => self.apply_contain(st, regions, assignment, radius),
+            Kind::Contain { regions, assignment, radius, half_width, half_height, .. } => {
+                self.apply_contain(st, regions, assignment, radius, half_width, half_height)
+            }
             Kind::Cohesion => self.apply_cohesion(st, alpha),
-            Kind::Directional { gap, axis_x, axis_y, iterations } => {
+            Kind::Directional { gap, axis_x, axis_y, iterations, .. } => {
                 self.apply_directional(st, gap, *axis_x, *axis_y, *iterations, alpha)
             }
         }
     }
 
-    /// The part of a force that runs after integration. Only a hard
-    /// containment has one. Returns true if it may have moved a node.
+    /// The part of a force that runs after integration: a hard containment
+    /// and a hard directional constraint have one. Returns true if it may
+    /// have moved a node.
     ///
     /// HARD CONTAINMENT. After positions have been integrated, every node in
-    /// a region is moved to `region.project(radius, position)`, and its
-    /// velocity is changed by the same amount, so that the velocity is still
-    /// the displacement the node actually made this tick. (The caller then
-    /// re-asserts pinned coordinates: a pin beats a region.)
+    /// a region is moved to `region.project_body(radius, half_width,
+    /// half_height, position)`, and its velocity is changed by the same
+    /// amount, so that the velocity is still the displacement the node
+    /// actually made this tick. (The caller then puts pinned coordinates
+    /// back: a pin beats a region.)
+    ///
+    /// HARD DIRECTIONAL CONSTRAINT. The gap asked for is the gap kept. A node
+    /// is HELD along the axis u if it is pinned on a coordinate the axis has
+    /// a part in (x when u.x is not 0, y when u.y is not 0). One pass takes
+    /// each link in order, on the positions as the links before it left
+    /// them, both ends finite:
+    ///   d = (p_target - p_source) . u
+    ///   if d < gap_link:
+    ///     short = gap_link - d
+    ///     if the target is not held:      p_target += u * short, v_target += u * short
+    ///     else if the source is not held: p_source -= u * short, v_source -= u * short
+    ///     else:                           nothing
+    /// So the target gives way, and the source only where the target cannot.
+    /// Passes repeat until one moves nothing, `DIRECTIONAL_PASSES` at most (a
+    /// chain of links listed child-first needs one pass per link; a cycle
+    /// can never be satisfied and stops at the limit). A link whose gap or
+    /// strength is NaN, or with an end out of range, is left alone, as the
+    /// soft force leaves it.
     pub fn constrain(&self, st: &mut State) -> bool {
-        let Kind::Contain { regions, assignment, radius, hard: true } = &self.kind else {
-            return false;
-        };
-        for i in 0..st.n {
-            let Some(region) = region_of(regions, assignment, i) else { continue };
-            let x = st.positions[i * 2];
-            let y = st.positions[i * 2 + 1];
-            if !(x.is_finite() && y.is_finite()) {
-                continue;
+        match &self.kind {
+            Kind::Contain { regions, assignment, radius, half_width, half_height, hard: true } => {
+                for i in 0..st.n {
+                    let Some(region) = region_of(regions, assignment, i) else { continue };
+                    let x = st.positions[i * 2];
+                    let y = st.positions[i * 2 + 1];
+                    if !(x.is_finite() && y.is_finite()) {
+                        continue;
+                    }
+                    let (cx, cy) = region.project_body(
+                        node_radius(radius, i),
+                        half_extent(half_width, i),
+                        half_extent(half_height, i),
+                        x,
+                        y,
+                    );
+                    st.velocities[i * 2] += cx - x;
+                    st.velocities[i * 2 + 1] += cy - y;
+                    st.positions[i * 2] = cx;
+                    st.positions[i * 2 + 1] = cy;
+                }
+                true
             }
-            let (cx, cy) = region.project(node_radius(radius, i), x, y);
-            st.velocities[i * 2] += cx - x;
-            st.velocities[i * 2 + 1] += cy - y;
-            st.positions[i * 2] = cx;
-            st.positions[i * 2 + 1] = cy;
+            Kind::Directional { gap, axis_x, axis_y, hard: true, .. } => {
+                let (axis_x, axis_y) = (*axis_x, *axis_y);
+                let m = st.links.len() / 2;
+                let State { positions, velocities, fixed, links, link_bias, .. } = st;
+                let held = |fixed: &[Real], i: usize| {
+                    (axis_x != 0.0 && !fixed[i * 2].is_nan()) || (axis_y != 0.0 && !fixed[i * 2 + 1].is_nan())
+                };
+                for _ in 0..DIRECTIONAL_PASSES {
+                    let mut moved = false;
+                    for i in 0..m {
+                        let g = gap.at(i);
+                        if link_bias[i].is_nan() || g.is_nan() || self.strength.at(i).is_nan() {
+                            continue;
+                        }
+                        let s = links[i * 2] as usize;
+                        let t = links[i * 2 + 1] as usize;
+                        let (tx, ty, sx, sy) = (positions[t * 2], positions[t * 2 + 1], positions[s * 2], positions[s * 2 + 1]);
+                        if !(tx.is_finite() && ty.is_finite() && sx.is_finite() && sy.is_finite()) {
+                            continue;
+                        }
+                        let x = tx - sx;
+                        let y = ty - sy;
+                        let d = x * axis_x + y * axis_y;
+                        if !(d < g) {
+                            continue;
+                        }
+                        let short = g - d;
+                        let step_x = axis_x * short;
+                        let step_y = axis_y * short;
+                        if !held(fixed, t) {
+                            velocities[t * 2] += step_x;
+                            velocities[t * 2 + 1] += step_y;
+                            positions[t * 2] += step_x;
+                            positions[t * 2 + 1] += step_y;
+                            moved = true;
+                        } else if !held(fixed, s) {
+                            velocities[s * 2] -= step_x;
+                            velocities[s * 2 + 1] -= step_y;
+                            positions[s * 2] -= step_x;
+                            positions[s * 2 + 1] -= step_y;
+                            moved = true;
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+                true
+            }
+            _ => false,
         }
-        true
     }
 
     /// d3 `manyBody.js`: Barnes-Hut over a quadtree of the current positions.
@@ -796,40 +909,114 @@ impl Force {
     /// rectangles apart along the axis on which they overlap least.
     ///
     /// Node i is a rectangle of half-width w_i and half-height h_i centred
-    /// on its anticipated position a_i = position + velocity. One iteration:
+    /// on its anticipated position a_i = position + velocity. A node is HELD
+    /// on an axis if it cannot be moved along it: it is pinned there (its
+    /// `fixed` coordinate on that axis is not NaN). One iteration:
     ///
     /// 1. Take a_i for every node, all at once, before anything moves.
-    /// 2. For every ordered pair (i, j), j != i, both a finite, taking j in
-    ///    ascending order for each i:
+    /// 2. For every node i that takes part, and every other node j that
+    ///    takes part and may collide with it (see "Who collides"), both a
+    ///    finite, taking j in ascending order:
     ///      dx = a_i.x - a_j.x          dy = a_i.y - a_j.y
     ///      ox = (w_i + w_j) - |dx|     oy = (h_i + h_j) - |dy|
-    ///    The pair overlaps when ox > 0 and oy > 0. If it does:
-    ///      share = A_j / (A_i + A_j) with A = w * h, or 1/2 if A_i + A_j = 0
-    ///      if ox <= oy:  v_i.x += s * ox * strength * share
-    ///      otherwise:    v_i.y += s * oy * strength * share
+    ///    The pair overlaps when ox > 0 and oy > 0. If it does, the push is
+    ///    along x if ox <= oy and along y otherwise. If i is held on that
+    ///    axis, nothing more happens for this pair. Otherwise
+    ///      share = 1                      if j is held on that axis
+    ///            = A_j / (A_i + A_j)      otherwise, with A = w * h
+    ///                                     (1/2 if A_i + A_j is not above 0)
+    ///      push  = s * overlap * strength * share
+    ///      v_i[axis] += push
     ///    where s is the sign of dx (or dy): +1 if positive, -1 if negative,
     ///    and if exactly zero, -1 when i < j and +1 when i > j.
     ///
-    /// So each rectangle of a pair takes the part of the overlap that the
-    /// other's area is of their total (the larger moves less), the two parts
-    /// sum to the overlap, and with strength 1 one isolated pair is exactly
-    /// separated. Every correction in an iteration is computed from the same
-    /// snapshot (Jacobi, not d3-collide's ordered sweep), so the result does
-    /// not depend on the order nodes are visited in and no node is favoured
-    /// by its index; the price is that crowded rectangles need iterations.
-    /// Not scaled by alpha, as d3's collide is not.
+    /// So a held rectangle is never moved, and what overlaps it takes the
+    /// whole correction; two free rectangles share it, the smaller moving
+    /// more, the two parts sum to the overlap, and with strength 1 one
+    /// isolated pair is exactly separated.
+    ///
+    /// THE SQUEEZE. A wide rectangle nearly always overlaps another least
+    /// vertically, so it is only ever pushed up or down; caught between two
+    /// things that do not give way (two pinned dots, a dot and a packed row
+    /// of other labels) the pushes cancel and it sits on both for ever. With
+    /// `through`, after the last iteration of one application of the force,
+    /// for each node i and each axis it is not held on: let `up` be the sum
+    /// of the positive pushes step 2 gave it on that axis over all the
+    /// iterations, and `down` the sum of the negative ones, as a magnitude.
+    /// If both are above 0 the node is squeezed, and it goes with one side
+    /// and ignores the other:
+    ///   v_i[axis] += down     if it goes up   (the downward pushes are undone)
+    ///   v_i[axis] -= up       if it goes down
+    /// It goes the way it was already moving, if it was moving: with w its
+    /// velocity on that axis as it was when the force was applied, if
+    /// |w| > 0.001 * (up + down) it goes up when w > 0 and down when w < 0.
+    /// Otherwise (a velocity that small is what is left of a movement long
+    /// over, or the last of a pull dying away) it goes with the stronger
+    /// side: up if up > down, down if up < down, and if they are equal, up
+    /// when i is odd and down when it is even.
+    ///
+    /// Going the way it is moving is what makes this resolve: the rectangle
+    /// keeps on through whatever was squeezing it, a dot or another
+    /// rectangle, until it is clear, where a rule that only compared the two
+    /// sides would turn round as soon as it went deeper into the weaker one.
+    /// It suits rectangles that nothing else is pressing together. Under a
+    /// force that keeps pressing, a squeeze is permanent and the rectangle
+    /// will be walked through its neighbour, so let such a pull die away
+    /// before expecting rest. Without `through`, step 2 is all there is.
+    ///
+    /// Who collides. With a node filter (`self.mask`), a node left out
+    /// collides with nothing and nothing collides with it. With groups
+    /// (`self.groups`), `pairs` restricts the pairs: only two nodes of the
+    /// same group (`Within`), or only two nodes not of the same group
+    /// (`Between`; a node in no group is in a different group from
+    /// everyone).
+    ///
+    /// Every correction in an iteration is computed from the same snapshot
+    /// (Jacobi, not d3-collide's ordered sweep), so the result does not
+    /// depend on the order nodes are visited in and no node is favoured by
+    /// its index; the price is that crowded rectangles need iterations. Not
+    /// scaled by alpha, as d3's collide is not.
     ///
     /// The quadtree only finds the candidates: for each i the rectangles that
     /// can overlap it are collected, sorted by index and applied in that
     /// order, which makes the result identical, bit for bit, to the loop over
     /// all pairs above.
-    fn apply_rect_collide(&self, st: &mut State, half_width: &Per, half_height: &Per, iterations: u32) {
+    fn apply_rect_collide(
+        &self,
+        st: &mut State,
+        half_width: &Per,
+        half_height: &Per,
+        iterations: u32,
+        pairs: Scope,
+        through: bool,
+    ) {
         let n = st.n;
         let strength = self.uniform_strength();
-        let State { positions, velocities, tree, stack, scratch_xy, scratch_index, .. } = st;
+        let mask = self.mask.as_deref();
+        let included = |i: usize| match mask {
+            Some(mask) => !matches!(mask.get(i), Some(0) | None),
+            None => true,
+        };
+        let may = |i: usize, j: usize| match pairs {
+            Scope::All => true,
+            Scope::Within => self.group_of(i) != NONE_ID && self.group_of(i) == self.group_of(j),
+            Scope::Between => !(self.group_of(i) != NONE_ID && self.group_of(i) == self.group_of(j)),
+        };
+        let State { positions, velocities, fixed, tree, stack, scratch, scratch_xy, scratch_index, .. } = st;
         let positions: &[Real] = positions;
+        let fixed: &[Real] = fixed;
         let anticipated = scratch_xy;
         let candidates = scratch_index;
+
+        // Per node, for the squeeze: the velocity when the force was applied
+        // (x, y), then up and down on x, then up and down on y.
+        let pushed = scratch;
+        pushed.clear();
+        if through {
+            for i in 0..n {
+                pushed.extend([velocities[i * 2], velocities[i * 2 + 1], 0.0, 0.0, 0.0, 0.0]);
+            }
+        }
 
         for _ in 0..iterations {
             anticipated.clear();
@@ -841,6 +1028,9 @@ impl Force {
             let tree: &Quadtree = tree;
 
             for i in 0..n {
+                if !included(i) {
+                    continue;
+                }
                 let xi = a[i * 2];
                 let yi = a[i * 2 + 1];
                 if !(xi.is_finite() && yi.is_finite()) {
@@ -848,13 +1038,15 @@ impl Force {
                 }
                 let wi = half_extent(half_width, i);
                 let hi = half_extent(half_height, i);
+                let held_x = !fixed[i * 2].is_nan();
+                let held_y = !fixed[i * 2 + 1].is_nan();
 
                 candidates.clear();
                 tree.visit(stack, |q, x0, y0, x1, y1| {
                     if is_leaf(q) {
                         let mut p = leaf_point(q) as u32;
                         while p != NONE {
-                            if p as usize != i {
+                            if p as usize != i && included(p as usize) && may(i, p as usize) {
                                 candidates.push(p);
                             }
                             p = tree.next[p as usize];
@@ -883,15 +1075,39 @@ impl Force {
                         continue;
                     }
                     let area_j = wj * hj;
-                    let share = if area_i + area_j > 0.0 { area_j / (area_i + area_j) } else { 0.5 };
+                    let by_area = if area_i + area_j > 0.0 { area_j / (area_i + area_j) } else { 0.5 };
                     let tie: Real = if i < j { -1.0 } else { 1.0 };
-                    if ox <= oy {
-                        let s = if dx > 0.0 { 1.0 } else if dx < 0.0 { -1.0 } else { tie };
-                        velocities[i * 2] += s * ox * strength * share;
-                    } else {
-                        let s = if dy > 0.0 { 1.0 } else if dy < 0.0 { -1.0 } else { tie };
-                        velocities[i * 2 + 1] += s * oy * strength * share;
+                    // 0 for x, 1 for y.
+                    let (axis, offset, overlap, held) = if ox <= oy { (0, dx, ox, held_x) } else { (1, dy, oy, held_y) };
+                    if held {
+                        continue;
                     }
+                    let share = if !fixed[j * 2 + axis].is_nan() { 1.0 } else { by_area };
+                    let s = if offset > 0.0 { 1.0 } else if offset < 0.0 { -1.0 } else { tie };
+                    let push = s * overlap * strength * share;
+                    velocities[i * 2 + axis] += push;
+                    if through {
+                        if push > 0.0 {
+                            pushed[i * 6 + 2 + axis * 2] += push;
+                        } else if push < 0.0 {
+                            pushed[i * 6 + 3 + axis * 2] -= push;
+                        }
+                    }
+                }
+            }
+        }
+
+        if through {
+            for i in 0..n {
+                if !included(i) {
+                    continue;
+                }
+                let odd = i % 2 == 1;
+                let tx = through_squeeze(odd, pushed[i * 6], pushed[i * 6 + 2], pushed[i * 6 + 3]);
+                let ty = through_squeeze(odd, pushed[i * 6 + 1], pushed[i * 6 + 4], pushed[i * 6 + 5]);
+                if tx != 0.0 || ty != 0.0 {
+                    velocities[i * 2] += tx;
+                    velocities[i * 2 + 1] += ty;
                 }
             }
         }
@@ -901,14 +1117,23 @@ impl Force {
     /// region.
     ///
     /// For every node i that has a region, with a = position + velocity (its
-    /// anticipated position) finite and c = region.project(radius_i, a):
+    /// anticipated position) finite and c = region.project_body(radius_i,
+    /// half_width_i, half_height_i, a):
     ///   v += (c - a) * strength
     /// With strength 1 the node is aimed exactly at the nearest allowed
     /// point; it arrives short of it by the velocity decay, and the next
     /// tick corrects again. Not scaled by alpha: it is a constraint, like
     /// collide. A node already inside is not touched. See `constrain` for
     /// the hard part and `Region::project` for the geometry.
-    fn apply_contain(&self, st: &mut State, regions: &[Region], assignment: &Option<Vec<u32>>, radius: &Per) {
+    fn apply_contain(
+        &self,
+        st: &mut State,
+        regions: &[Region],
+        assignment: &Option<Vec<u32>>,
+        radius: &Per,
+        half_width: &Per,
+        half_height: &Per,
+    ) {
         let strength = self.uniform_strength();
         for i in 0..st.n {
             let Some(region) = region_of(regions, assignment, i) else { continue };
@@ -917,7 +1142,13 @@ impl Force {
             if !(ax.is_finite() && ay.is_finite()) {
                 continue;
             }
-            let (cx, cy) = region.project(node_radius(radius, i), ax, ay);
+            let (cx, cy) = region.project_body(
+                node_radius(radius, i),
+                half_extent(half_width, i),
+                half_extent(half_height, i),
+                ax,
+                ay,
+            );
             st.velocities[i * 2] += (cx - ax) * strength;
             st.velocities[i * 2 + 1] += (cy - ay) * strength;
         }
@@ -1140,7 +1371,32 @@ fn node_radius(radius: &Per, i: usize) -> Real {
     }
 }
 
-/// A half-extent for rectangle collision: NaN or unset is 0.
+/// What a squeezed rectangle adds to its velocity on one axis: the pushes
+/// of the side it ignores, undone. Nothing if it was not squeezed.
+#[inline]
+fn through_squeeze(odd: bool, start: Real, up: Real, down: Real) -> Real {
+    if up > 0.0 && down > 0.0 {
+        if start.abs() > 0.001 * (up + down) {
+            if start > 0.0 {
+                down
+            } else {
+                -up
+            }
+        } else if up > down {
+            down
+        } else if up < down {
+            -up
+        } else if odd {
+            down
+        } else {
+            -up
+        }
+    } else {
+        0.0
+    }
+}
+
+/// A half-extent (rectangle collision, containment): NaN or unset is 0.
 #[inline]
 fn half_extent(extent: &Per, i: usize) -> Real {
     let h = extent.at(i);
